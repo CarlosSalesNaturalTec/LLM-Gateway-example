@@ -1178,6 +1178,75 @@ Adicione system prompt fixo na configuração do modelo no `config.yaml`:
   Restart-Service LiteLLMGateway
   ```
 
+### Serviço inicia mas recusa conexões — proxy SSL corporativo
+
+**Sintoma:** `Get-Service LiteLLMGateway` mostra `Running`, mas `Invoke-RestMethod http://localhost:4000/health` retorna "conexão recusada ativamente". O `stderr.log` mostra:
+
+```
+requests.exceptions.SSLError: ... certificate verify failed: self signed certificate in certificate chain
+```
+
+**Causa:** O proxy corporativo intercepta conexões HTTPS usando um certificado auto-assinado. O Python rejeita esse certificado por padrão. O LiteLLM trava durante o import — antes de abrir a porta 4000 — quando o `tiktoken` tenta baixar o arquivo de encoding `cl100k_base.tiktoken` da Azure.
+
+**Solução aplicada (SERIN CGOTIC):** patch direto no código-fonte do tiktoken para ignorar verificação SSL:
+
+Arquivo: `C:\laragon\bin\python\python-3.10\lib\site-packages\tiktoken\load.py`
+
+Localizar a linha:
+```python
+resp = requests.get(blobpath)
+```
+Alterar para:
+```python
+resp = requests.get(blobpath, verify=False)
+```
+
+Após esse patch, na primeira inicialização o tiktoken baixará e fará cache do arquivo (em `%TEMP%\data-gym-cache\`). Nas inicializações seguintes o cache é usado e nenhuma conexão externa é feita.
+
+> ⚠️ **Atenção ao atualizar o LiteLLM ou tiktoken:** `pip install --upgrade` sobrescreve o `load.py` e o patch é perdido. Reaplique após cada atualização.
+
+> 💡 **Solução alternativa mais robusta:** exportar o certificado raiz do proxy corporativo e adicioná-lo ao bundle de certificados do Python (`certifi`). Isso resolve o problema sem necessidade de patches manuais.
+
+### Serviço trava no startup com UnicodeEncodeError
+
+**Sintoma:** após resolver o SSL, o `stderr.log` mostra:
+
+```
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 5-7: character maps to <undefined>
+ERROR:    Application startup failed. Exiting.
+```
+
+**Causa:** O banner ASCII do LiteLLM contém caracteres de box-drawing (`█`, `╗`, `╚` etc.) que o encoding padrão do Windows (`cp1252`) não consegue exibir. Como o serviço NSSM captura stdout/stderr com esse encoding, o crash ocorre ao tentar exibir o banner.
+
+**Solução aplicada:** capturar a exceção no `show_banner()`:
+
+Arquivo: `C:\laragon\bin\python\python-3.10\lib\site-packages\litellm\proxy\common_utils\banner.py`
+
+Localizar:
+```python
+    except ImportError:
+```
+Alterar para:
+```python
+    except (ImportError, UnicodeEncodeError):
+```
+
+> ⚠️ **Atenção ao atualizar o LiteLLM:** este arquivo também é sobrescrito em atualizações. Reaplique se o erro reaparecer após `pip upgrade`.
+
+### Variáveis de ambiente não chegam ao serviço NSSM
+
+**Sintoma:** variáveis definidas via `[System.Environment]::SetEnvironmentVariable(..., "Machine")` não são enxergadas pelo processo do LiteLLM, mesmo após `Restart-Service`.
+
+**Causa:** O serviço NSSM roda como conta `Local System` e pode ter um snapshot de ambiente diferente do que está no registro de sistema no momento do restart.
+
+**Solução:** definir as variáveis diretamente na aba **Environment** do NSSM (via GUI `nssm edit LiteLLMGateway`) ou no registro em:
+
+```
+HKLM:\SYSTEM\CurrentControlSet\Services\LiteLLMGateway\Parameters\AppEnvironmentExtra
+```
+
+Formato: uma variável por linha como `NOME=VALOR`. Essas variáveis têm precedência garantida sobre as de sistema para o processo do serviço.
+
 ---
 
 ## 6. Comandos de manutenção
